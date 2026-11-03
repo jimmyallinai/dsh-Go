@@ -191,7 +191,10 @@ typedef RemoteSessionOpener = Future<RemoteHostSession> Function(RemoteFailure? 
 /// * requests above 2 MiB use chunked transfers (Host must declare
 ///   `harness.remote.transfer.v1`), single messages are capped at 4 MiB;
 /// * Host / tunnel refusals (`METHOD_NOT_ALLOWED`, `RPC_TIMEOUT`,
-///   `RATE_LIMITED`, ...) surface as `{ok: false}` [DshRemoteException]s.
+///   `RATE_LIMITED`, ...) surface as `{ok: false}` [DshRemoteException]s;
+/// * a session that landed on the Relay re-runs transport selection on a
+///   timer ([upgradeInterval]) instead of waiting for a drop, so a direct
+///   path that recovers mid-session is picked up on its own.
 class RemoteTunnelCarrier extends DshCarrier {
   RemoteTunnelCarrier({
     required this.hostId,
@@ -200,6 +203,7 @@ class RemoteTunnelCarrier extends DshCarrier {
     this.streamControlTimeout = const Duration(seconds: 15),
     this.healthInterval = const Duration(seconds: 25),
     this.healthTimeout = const Duration(seconds: 10),
+    this.upgradeInterval = const Duration(minutes: 2),
     DshTracer? tracer,
   }) : _open = open,
        _tracer = tracer;
@@ -217,11 +221,21 @@ class RemoteTunnelCarrier extends DshCarrier {
   /// could time out and tear down a healthy connection.
   final Duration healthInterval;
   final Duration healthTimeout;
+
+  /// How long a session that landed on the Relay runs before the carrier
+  /// reconnects once to re-run transport selection, so a direct path that
+  /// has recovered since is picked up without waiting for the connection
+  /// to drop or the network to change (#328). Consecutive Relay sessions
+  /// back off (the wait doubles per session, capped at ×8); a session on
+  /// any other transport stops the cycle. `null` disables the retry.
+  final Duration? upgradeInterval;
   final DshTracer? _tracer;
 
   RemoteHostSession? _session;
   Future<RemoteHostSession>? _opening;
   Timer? _health;
+  Timer? _upgrade;
+  int _relayStreak = 0;
   Future<bool>? _probing;
   bool _closed = false;
   RemoteFailure? _lastFailure;
@@ -359,6 +373,7 @@ class RemoteTunnelCarrier extends DshCarrier {
         if (_session == session) {
           _session = null;
           _health?.cancel();
+          _upgrade?.cancel();
           if (reason.code != 'CLIENT_CLOSED') {
             _recordFailure(RemoteFailure(reason.code, reason.message, retryable: reason.retryable));
           }
@@ -366,6 +381,7 @@ class RemoteTunnelCarrier extends DshCarrier {
       }),
     );
     _startHealth(session);
+    _armUpgrade(session);
     if (!_sessions.isClosed) _sessions.add(session);
     return session;
   }
@@ -379,6 +395,28 @@ class RemoteTunnelCarrier extends DshCarrier {
     _health?.cancel();
     _health = Timer.periodic(healthInterval, (_) {
       if (_session == session && !session.isClosed && session.rpc.sinceInbound >= healthInterval) unawaited(probe());
+    });
+  }
+
+  /// Arms the one-shot direct-path retry for a Relay [session]; a session
+  /// on any other transport disarms it and resets the backoff (#328).
+  void _armUpgrade(RemoteHostSession session) {
+    _upgrade?.cancel();
+    _upgrade = null;
+    final interval = upgradeInterval;
+    if (interval == null || _closed) return;
+    if (session.transport != 'relay') {
+      _relayStreak = 0;
+      return;
+    }
+    final shift = _relayStreak > 3 ? 3 : _relayStreak;
+    _relayStreak++;
+    _upgrade = Timer(interval * (1 << shift), () {
+      if (_closed || _session != session || session.isClosed) return;
+      // Reconnecting re-runs transport selection in the opener: a direct
+      // path that has recovered is picked up, and a failed attempt lands
+      // back on the Relay under a fresh failure cooldown.
+      reconnect();
     });
   }
 
@@ -419,6 +457,7 @@ class RemoteTunnelCarrier extends DshCarrier {
     if (_session == session) {
       _session = null;
       _health?.cancel();
+      _upgrade?.cancel();
     }
     await session.close();
   }
@@ -608,6 +647,7 @@ class RemoteTunnelCarrier extends DshCarrier {
     if (_closed) return;
     _closed = true;
     _health?.cancel();
+    _upgrade?.cancel();
     final session = _session;
     _session = null;
     await session?.close();

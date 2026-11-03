@@ -610,6 +610,84 @@ void main() {
       expect(client.remoteCarrier!.state!.transport, 'relay');
     });
 
+    test('a stable Relay session retries direct by itself and upgrades when it recovers', () async {
+      await account.close();
+      account = RemoteAccount(
+        secrets: MemorySecretStore(),
+        serverUrl: server.url,
+        peerConnector: network.connector,
+        onDirectFallback: fallbacks.add,
+        directTimeout: const Duration(milliseconds: 300),
+        directCooldown: const Duration(milliseconds: 100),
+        upgradeInterval: const Duration(milliseconds: 250),
+      );
+      network.outcome = FakeRtcOutcome.fail;
+      final client = await connect();
+      expect(client.remoteCarrier!.state!.transport, 'relay');
+      expect(fallbacks, ['directFailed']);
+      expect(host.handshakes, hasLength(1));
+
+      // The direct path recovers while the Relay session stays up: the
+      // client must re-run transport selection on its own (#328).
+      network.outcome = FakeRtcOutcome.open;
+      await _eventually(() => client.remoteCarrier!.state!.transport == 'lan');
+      expect(host.handshakes, hasLength(2), reason: 'the upgrade opened a fresh session on the direct path');
+      expect(await client.listSessions(), isEmpty);
+      expect(fallbacks, ['directFailed'], reason: 'the upgrade added no new fallback');
+
+      // Direct sticks: no further reconnects are scheduled.
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      expect(host.handshakes, hasLength(2));
+    });
+
+    test('no direct retry is scheduled while the upgrade is disabled', () async {
+      await account.close();
+      account = RemoteAccount(
+        secrets: MemorySecretStore(),
+        serverUrl: server.url,
+        peerConnector: network.connector,
+        onDirectFallback: fallbacks.add,
+        directTimeout: const Duration(milliseconds: 300),
+        directCooldown: const Duration(milliseconds: 100),
+        upgradeInterval: null,
+      );
+      network.outcome = FakeRtcOutcome.fail;
+      final client = await connect();
+      expect(client.remoteCarrier!.state!.transport, 'relay');
+      expect(host.handshakes, hasLength(1));
+
+      network.outcome = FakeRtcOutcome.open;
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      expect(client.remoteCarrier!.state!.transport, 'relay');
+      expect(host.handshakes, hasLength(1), reason: 'nothing re-ran transport selection');
+    });
+
+    test('a failed upgrade attempt stays on the Relay and backs off instead of looping', () async {
+      await account.close();
+      account = RemoteAccount(
+        secrets: MemorySecretStore(),
+        serverUrl: server.url,
+        peerConnector: network.connector,
+        onDirectFallback: fallbacks.add,
+        directTimeout: const Duration(milliseconds: 300),
+        directCooldown: const Duration(milliseconds: 100),
+        upgradeInterval: const Duration(milliseconds: 200),
+      );
+      network.outcome = FakeRtcOutcome.fail;
+      final client = await connect();
+      expect(client.remoteCarrier!.state!.transport, 'relay');
+      expect(host.handshakes, hasLength(1));
+
+      await Future<void>.delayed(const Duration(milliseconds: 1600));
+      expect(client.remoteCarrier!.state!.transport, 'relay');
+      expect(await client.listSessions(), isEmpty);
+      expect(
+        host.handshakes.length,
+        inInclusiveRange(2, 5),
+        reason: 'the retry happened, but backoff kept it from spinning',
+      );
+    });
+
     test('traces redact SDP and candidates', () async {
       final traced = <String>[];
       await account.close();

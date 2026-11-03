@@ -266,6 +266,8 @@ class RemoteAccount {
     this.onDirectFallback,
     this.directTimeout = const Duration(seconds: 8),
     this.iceServersTimeout = const Duration(seconds: 10),
+    this.directCooldown = const Duration(seconds: 45),
+    this.upgradeInterval = const Duration(minutes: 2),
   }) : serverUrl = normalizeServerUrl(serverUrl ?? defaultRemoteServer),
        _secrets = secrets,
        _socketConnector = socketConnector {
@@ -304,6 +306,16 @@ class RemoteAccount {
   /// Budget for each connection's fresh STUN/TURN credential request,
   /// separate from the DataChannel negotiation deadline.
   final Duration iceServersTimeout;
+
+  /// How long a failed direct (or TURN) path is skipped after a failure;
+  /// a changed native network hint clears the skip early.
+  final Duration directCooldown;
+
+  /// How long a Relay session runs before the carrier reconnects once to
+  /// re-run transport selection, so a direct path that has recovered is
+  /// picked up without waiting for a drop (#328). See
+  /// [RemoteTunnelCarrier.upgradeInterval]; `null` disables the retry.
+  final Duration? upgradeInterval;
   late final RemoteServerApi api;
   final SecretStore _secrets;
   final ControlSocketConnector? _socketConnector;
@@ -753,6 +765,7 @@ class RemoteAccount {
       open: (last) => _openHostSession(host, last, confirmNewHost),
       healthInterval: healthInterval,
       healthTimeout: healthTimeout,
+      upgradeInterval: upgradeInterval,
       tracer: tracer,
     );
     final client = DshClient.withCarrier(carrier, muxOptions: muxOptions);
@@ -865,7 +878,7 @@ class RemoteAccount {
     unawaited(
       rpc.done.then((reason) {
         if (!reason.retryable || reason.code == 'CLIENT_CLOSED') return;
-        final until = DateTime.now().add(const Duration(seconds: 45));
+        final until = DateTime.now().add(directCooldown);
         switch (transport is WebRtcTransport ? transport.actualMode ?? transport.mode : transport.mode) {
           case RemoteTransportMode.lan || RemoteTransportMode.p2p:
             _directCooldown[host.id] = until;
@@ -965,7 +978,7 @@ class RemoteAccount {
   /// then the Relay. Each failed stage gets a fresh authorized connection:
   /// the Host may still hold state for the old one. Noise always starts only
   /// after the final data plane is chosen. Recent failures skip the bad path
-  /// for 45 seconds; a changed native network hint clears that cooldown.
+  /// for [directCooldown]; a changed native network hint clears that cooldown.
   Future<_TransportSelection> _connectTransport(String token, String hostId) async {
     final connector = peerConnector;
     if (connector == null) {
@@ -1017,7 +1030,7 @@ class RemoteAccount {
       } on WebRtcUnavailable catch (error) {
         directFailed = true;
         reason = error.timedOut ? RemoteNetworkFallbackReason.directTimeout : RemoteNetworkFallbackReason.directFailed;
-        _directCooldown[hostId] = DateTime.now().add(const Duration(seconds: 45));
+        _directCooldown[hostId] = DateTime.now().add(directCooldown);
         _notifyFallback(reason);
       }
       if (wantTurn) control = await _connectRelay(token, hostId, direct: true, preferred: preferred);
@@ -1039,7 +1052,7 @@ class RemoteAccount {
         } else {
           reason = error.timedOut ? RemoteNetworkFallbackReason.turnTimeout : RemoteNetworkFallbackReason.turnFailed;
         }
-        _turnCooldown[hostId] = DateTime.now().add(const Duration(seconds: 45));
+        _turnCooldown[hostId] = DateTime.now().add(directCooldown);
         // Missing credentials should not duplicate the direct-stage reason.
         if (!error.turnUnavailable || !directFailed) {
           _notifyFallback(reason);
