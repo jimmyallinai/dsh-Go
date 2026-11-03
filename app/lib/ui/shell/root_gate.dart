@@ -11,6 +11,7 @@ import '../../diagnostics/diagnostics_publish.dart';
 import '../../runtime/runtime_bridge.dart';
 import '../../runtime/runtime_state.dart';
 import '../../share_code/guest_fs.dart';
+import '../../state/connection_state.dart';
 import '../../state/engine_control.dart';
 import '../../state/hosts_state.dart';
 import '../../state/notify_state.dart';
@@ -101,6 +102,12 @@ class _RootGateState extends ConsumerState<RootGate> {
 
   /// Published this engine run's diagnostics snapshot (the agent reads it on demand).
   bool _publishedDiagnostics = false;
+
+  /// `host:state` of the connection section as the last published snapshot
+  /// shows it. The first snapshot of a run is written while the connection
+  /// is still being built, so a later observation that differs republishes
+  /// instead of leaving the transient value frozen in the file (#322).
+  String? _publishedConnectionKey;
   bool _launchReady = false;
   OnboardingStep? _step;
   bool _autoStartDone = false;
@@ -236,8 +243,31 @@ class _RootGateState extends ConsumerState<RootGate> {
   void _publishDiagnostics() {
     if (_publishedDiagnostics || Platform.environment.containsKey('FLUTTER_TEST')) return;
     _publishedDiagnostics = true;
+    _writeDiagnostics();
+  }
+
+  /// Writes the snapshot again once the connection observation moves past
+  /// what the published snapshot shows. The first write of a run lands in
+  /// the frame that saw the engine come up, when the connection is still
+  /// 'connecting'; without this the file keeps that transient state for the
+  /// whole run (#322). Later observations with the same host and state do
+  /// not rewrite.
+  void _republishDiagnostics() {
+    if (!_publishedDiagnostics || Platform.environment.containsKey('FLUTTER_TEST')) return;
+    if (_connectionKey() == _publishedConnectionKey) return;
+    _writeDiagnostics();
+  }
+
+  String _connectionKey() {
+    final snapshot = ref.read(connectionDiagnosticsProvider).snapshot;
+    return '${snapshot['host']}:${snapshot['state']}';
+  }
+
+  void _writeDiagnostics() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) unawaited(ref.read(diagnosticsPublisherProvider).publish());
+      if (!mounted) return;
+      _publishedConnectionKey = _connectionKey();
+      unawaited(ref.read(diagnosticsPublisherProvider).publish());
     });
   }
 
@@ -319,8 +349,12 @@ class _RootGateState extends ConsumerState<RootGate> {
         _publishDiagnostics();
       } else {
         _publishedDiagnostics = false;
+        _publishedConnectionKey = null;
       }
     });
+    // The connection usually settles after that first snapshot was written;
+    // republish so the file shows the settled state, not 'connecting' (#322).
+    ref.listen(activeConnectionProvider, (_, _) => _republishDiagnostics());
     if (runtime.status.phase == RuntimePhase.running) _publishDiagnostics();
 
     final Widget child;
